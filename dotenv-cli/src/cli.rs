@@ -1,218 +1,263 @@
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
-use clap::{Args, Parser, Subcommand, command};
 use dotenv_analyzer::LintKind;
 use dotenv_schema::DotEnvSchema;
 
-use crate::{CheckOptions, DiffOptions, FixOptions, Result};
+use crate::{
+    diff::{DiffFileType, DiffWarning},
+    output::{check::CheckOutput, diff::DiffOutput, fix::FixOutput},
+};
 
-const HELP_TEMPLATE: &str = "
-{before-help}{name} {version}
-{author-with-newline}{about-with-newline}
-{usage-heading} {usage}
+mod fs_utils;
 
-{all-args}{after-help}
-";
+pub mod cli;
+mod diff;
+mod output;
 
-#[derive(Parser)]
-#[command(
-    version,
-    about,
-    author,
-    help_template = HELP_TEMPLATE,
-    styles = clap::builder::Styles::styled()
-        .header(clap::builder::styling::AnsiColor::Yellow.on_default())
-        .usage(clap::builder::styling::AnsiColor::Yellow.on_default())
-        .literal(clap::builder::styling::AnsiColor::Cyan.on_default())
-        .placeholder(clap::builder::styling::AnsiColor::Blue.on_default())
-        .context(clap::builder::styling::AnsiColor::Green.on_default())
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-    /// Switch to plain text output without colors
-    #[arg(long, global = true)]
-    plain: bool,
-
-    /// Display only critical results, suppressing extra details
-    #[arg(short, long, global = true)]
-    quiet: bool,
+pub struct CheckOptions<'a> {
+    pub files: Vec<&'a PathBuf>,
+    pub ignore_checks: Vec<LintKind>,
+    pub exclude: Vec<&'a PathBuf>,
+    pub quiet: bool,
+    pub recursive: bool,
+    pub schema: Option<DotEnvSchema>,
+    /// When set, check this (content, display_name) pair read from STDIN
+    /// instead of searching `files` on disk.
+    pub stdin: Option<(String, String)>,
 }
 
-#[derive(Subcommand)]
-enum Command {
-    /// Check .env files for errors such as duplicate keys or invalid syntax
-    Check {
-        /// .env files or directories to check (one or more required)
-        #[arg(
-            num_args(1..),
-            required = true,
-        )]
-        files: Vec<PathBuf>,
+pub fn check(opts: &CheckOptions, current_dir: &PathBuf) -> Result<usize> {
+    if let Some((content, display_name)) = &opts.stdin {
+        let (fe, lines) = dotenv_finder::FileEntry::from_stdin(content, display_name.clone());
+        let output = CheckOutput::new(opts.quiet).files_count(1);
 
-        #[command(flatten)]
-        common: CommonArgs,
+        output.print_processing_info(&fe);
+        let warnings = dotenv_analyzer::check(&lines, &opts.ignore_checks, opts.schema.as_ref());
+        output.print_warnings(&fe, &warnings, 0);
 
-        /// Schema file to validate .env file contents
-        #[arg(short('s'), long, value_name = "PATH")]
-        schema: Option<PathBuf>,
-
-        /// Disable checking for application updates
-        #[cfg(feature = "update-informer")]
-        #[arg(long, env = "DOTENV_LINTER_SKIP_UPDATES")]
-        skip_updates: bool,
-    },
-    /// Automatically fix issues in .env files
-    Fix {
-        /// .env files or directories to fix (one or more required)
-        #[arg(
-            num_args(1..),
-            required = true,
-        )]
-        files: Vec<PathBuf>,
-
-        #[command(flatten)]
-        common: CommonArgs,
-
-        /// Prevent creating backups before applying fixes
-        #[arg(long)]
-        no_backup: bool,
-
-        /// Print fixed .env content to stdout without saving changes
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Compare .env files to ensure matching key sets
-    Diff {
-        /// .env files or directories to compare (one or more required)
-        #[arg(
-            num_args(1..),
-            required = true,
-        )]
-        files: Vec<PathBuf>,
-    },
-}
-
-#[derive(Args)]
-struct CommonArgs {
-    /// Files or directories to exclude from linting or fixing
-    #[arg(short = 'e', long, value_name = "PATH")]
-    exclude: Vec<PathBuf>,
-
-    /// Lint checks to bypass
-    #[arg(
-        short,
-        long,
-        value_name = "CHECK_NAME",
-        value_delimiter = ',',
-        env = "DOTENV_LINTER_IGNORE_CHECKS"
-    )]
-    ignore_checks: Vec<LintKind>,
-
-    /// Recursively scan directories for .env files
-    #[arg(short, long)]
-    recursive: bool,
-}
-
-pub fn run() -> Result<i32> {
-    #[cfg(windows)]
-    colored::control::set_virtual_terminal(true).ok();
-
-    let cli = Cli::parse();
-    let current_dir = std::env::current_dir()?;
-
-    if cli.plain {
-        colored::control::set_override(false);
+        let warnings_count = warnings.len();
+        output.print_total(warnings_count);
+        return Ok(warnings_count);
     }
 
-    match cli.command {
-        Command::Check {
-            files,
-            common,
-            schema,
-            #[cfg(feature = "update-informer")]
-                skip_updates: not_check_updates,
-        } => {
-            let mut dotenv_schema = None;
-            if let Some(path) = schema {
-                dotenv_schema = match DotEnvSchema::load(path) {
-                    Ok(schema) => Some(schema),
-                    Err(err) => {
-                        println!("Error loading schema: {err}");
-                        std::process::exit(1);
-                    }
-                };
+    let files = dotenv_finder::FinderBuilder::new(current_dir)
+        .with_paths(&opts.files)
+        .exclude(&opts.exclude)
+        .recursive(opts.recursive)
+        .build()
+        .find();
+
+    let output = CheckOutput::new(opts.quiet);
+
+    if files.is_empty() {
+        output.print_nothing_to_check();
+        return Ok(0);
+    }
+
+    let output = output.files_count(files.len());
+
+    let warnings_count = files
+        .into_iter()
+        .enumerate()
+        .fold(0, |acc, (index, (fe, lines))| {
+            output.print_processing_info(&fe);
+
+            let warnings =
+                dotenv_analyzer::check(&lines, &opts.ignore_checks, opts.schema.as_ref());
+            output.print_warnings(&fe, &warnings, index);
+            acc + warnings.len()
+        });
+
+    output.print_total(warnings_count);
+    Ok(warnings_count)
+}
+
+pub struct FixOptions<'a> {
+    pub files: Vec<&'a PathBuf>,
+    pub ignore_checks: Vec<LintKind>,
+    pub exclude: Vec<&'a PathBuf>,
+    pub quiet: bool,
+    pub recursive: bool,
+    pub no_backup: bool,
+    pub dry_run: bool,
+    /// When set, fix this (content, display_name) pair read from STDIN
+    /// instead of searching `files` on disk. Always behaves as a dry run,
+    /// since there is no source file to write the result back to.
+    pub stdin: Option<(String, String)>,
+}
+
+pub fn fix(opts: &FixOptions, current_dir: &PathBuf) -> Result<()> {
+    if let Some((content, display_name)) = &opts.stdin {
+        let (fe, mut lines) = dotenv_finder::FileEntry::from_stdin(content, display_name.clone());
+        let output = FixOutput::new(opts.quiet).files_count(1);
+
+        output.print_processing_info(&fe);
+
+        let warnings = dotenv_analyzer::check(&lines, &opts.ignore_checks, None);
+        if warnings.is_empty() {
+            output.print_total(0);
+            return Ok(());
+        }
+
+        let fixes_done = dotenv_analyzer::fix(&warnings, &mut lines, &opts.ignore_checks);
+        if fixes_done != warnings.len() {
+            output.print_not_all_warnings_fixed();
+        }
+
+        // STDIN input has no backing file, so always print the result
+        // instead of writing anything to disk.
+        output.print_dry_run(&lines);
+        output.print_warnings(&fe, &warnings, 0);
+        output.print_total(warnings.len());
+        return Ok(());
+    }
+
+    let files = dotenv_finder::FinderBuilder::new(current_dir)
+        .with_paths(&opts.files)
+        .exclude(&opts.exclude)
+        .recursive(opts.recursive)
+        .build()
+        .find();
+
+    let output = FixOutput::new(opts.quiet);
+
+    if files.is_empty() {
+        output.print_nothing_to_fix();
+        return Ok(());
+    }
+
+    let output = output.files_count(files.len());
+
+    let mut warnings_count = 0;
+    for (index, (fe, mut lines)) in files.into_iter().enumerate() {
+        output.print_processing_info(&fe);
+
+        let warnings = dotenv_analyzer::check(&lines, &opts.ignore_checks, None);
+        if warnings.is_empty() {
+            continue;
+        }
+
+        let fixes_done = dotenv_analyzer::fix(&warnings, &mut lines, &opts.ignore_checks);
+        if fixes_done != warnings.len() {
+            output.print_not_all_warnings_fixed();
+        }
+
+        if opts.dry_run {
+            output.print_dry_run(&lines);
+        } else if fixes_done > 0 {
+            let should_backup = !opts.no_backup;
+            // create backup copy unless user specifies not to
+            if should_backup {
+                let backup_file = fs_utils::backup_file(&fe)?;
+                output.print_backup(&backup_file);
             }
 
-            let total_warnings = crate::check(
-                &CheckOptions {
-                    files: files.iter().collect(),
-                    ignore_checks: common.ignore_checks,
-                    exclude: common.exclude.iter().collect(),
-                    recursive: common.recursive,
-                    quiet: cli.quiet,
-                    schema: dotenv_schema,
-                },
-                &current_dir,
-            )?;
+            // write corrected file
+            fs_utils::write_file(&fe.path, lines)?;
+        }
 
-            #[cfg(feature = "update-informer")]
-            if !not_check_updates && !cli.quiet {
-                crate::check_for_updates();
-            }
+        output.print_warnings(&fe, &warnings, index);
+        warnings_count += warnings.len();
+    }
 
-            if total_warnings == 0 {
-                return Ok(0);
+    output.print_total(warnings_count);
+    Ok(())
+}
+
+pub struct DiffOptions<'a> {
+    pub files: Vec<&'a PathBuf>,
+    pub quiet: bool,
+}
+
+// Compares if different environment files contains the same variables and returns warnings if not
+pub fn diff(opts: &DiffOptions, current_dir: &PathBuf) -> Result<usize> {
+    let files = dotenv_finder::FinderBuilder::new(current_dir)
+        .with_paths(&opts.files)
+        .build()
+        .find();
+    let output = DiffOutput::new(opts.quiet);
+
+    if files.is_empty() || files.len() < 2 {
+        output.print_nothing_to_compare();
+        return Ok(0);
+    }
+
+    // Create DiffFileType structures for each file
+    let mut all_keys: HashSet<String> = HashSet::new();
+    let mut files_to_compare: Vec<DiffFileType> = Vec::new();
+    for (fe, lines) in files.into_iter() {
+        output.print_processing_info(&fe);
+
+        let mut keys: Vec<String> = Vec::new();
+
+        for line in lines {
+            if let Some(key) = line.get_key() {
+                all_keys.insert(key.to_string());
+                keys.push(key.to_string());
             }
         }
-        Command::Fix {
-            files,
-            common,
-            no_backup,
-            dry_run,
-        } => {
-            crate::fix(
-                &FixOptions {
-                    files: files.iter().collect(),
-                    ignore_checks: common.ignore_checks,
-                    exclude: common.exclude.iter().collect(),
-                    recursive: common.recursive,
-                    quiet: cli.quiet,
 
-                    no_backup,
-                    dry_run,
-                },
-                &current_dir,
-            )?;
+        let file_to_compare: DiffFileType = DiffFileType::new(fe.path, keys);
 
-            return Ok(0);
-        }
-        Command::Diff { files } => {
-            let total_warnings = crate::diff(
-                &DiffOptions {
-                    files: files.iter().collect(),
-                    quiet: cli.quiet,
-                },
-                &current_dir,
-            )?;
+        files_to_compare.push(file_to_compare);
+    }
 
-            if total_warnings == 0 {
-                return Ok(0);
-            }
+    // Create warnings if any file misses any key
+    let mut warnings: Vec<DiffWarning> = Vec::new();
+    for file in files_to_compare {
+        let missing_keys: Vec<_> = all_keys
+            .iter()
+            .filter(|key| !file.keys().contains(key))
+            .map(|key| key.to_owned())
+            .collect();
+
+        if !missing_keys.is_empty() {
+            let warning = DiffWarning::new(file.path().clone(), missing_keys);
+
+            warnings.push(warning)
         }
     }
 
-    Ok(1)
+    // Create success message if no warnings found.
+    if warnings.is_empty() {
+        output.print_no_difference_found();
+        return Ok(0);
+    }
+
+    output.print_warnings(&warnings);
+    Ok(warnings.len())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Checks for updates and prints information about the new version to `STDOUT`
+#[cfg(feature = "update-informer")]
+pub(crate) fn check_for_updates() {
+    use colored::*;
+    use update_informer::{Check, registry};
 
-    #[test]
-    fn verify_cli() {
-        use clap::CommandFactory;
-        Cli::command().debug_assert();
+    let pkg_name = env!("CARGO_PKG_NAME");
+    #[cfg(not(feature = "stub_check_version"))]
+    let current_version = env!("CARGO_PKG_VERSION");
+    #[cfg(feature = "stub_check_version")]
+    let current_version = "3.0.0";
+
+    #[cfg(not(feature = "stub_check_version"))]
+    let informer = update_informer::new(registry::Crates, pkg_name, current_version);
+    #[cfg(feature = "stub_check_version")]
+    let informer = update_informer::fake(registry::Crates, pkg_name, current_version, "3.1.1");
+
+    if let Ok(Some(version)) = informer.check_version() {
+        let msg = format!(
+            "A new release of {pkg_name} is available: v{current_version} -> {new_version}",
+            pkg_name = pkg_name.italic().cyan(),
+            current_version = current_version,
+            new_version = version.to_string().green()
+        );
+
+        let release_url =
+            format!("https://github.com/{pkg_name}/{pkg_name}/releases/tag/{version}").yellow();
+
+        println!("\n{msg}\n{release_url}");
     }
 }
